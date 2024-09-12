@@ -43,15 +43,3 @@ using ResNet-56 architectures on the CIFAR-10 dataset.](./experiments/Acc_FLOPs.
 
 This project makes use of the code from [Torch-Pruning](https://github.com/VainF/Torch-Pruning), developed by Gongfan Fang et al. The original code is licensed under the MIT License.
 
-If you use this project, please also consider citing their work:
-
-```bibtex
-
-
-@inproceedings{fang2023depgraph,
-  title={Depgraph: Towards any structural pruning},
-  author={Fang, Gongfan and Ma, Xinyin and Song, Mingli and Mi, Michael Bi and Wang, Xinchao},
-  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
-  pages={16091--16101},
-  year={2023}
-}
