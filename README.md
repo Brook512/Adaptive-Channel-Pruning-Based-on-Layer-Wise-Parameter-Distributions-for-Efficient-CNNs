@@ -42,7 +42,6 @@ using ResNet-56 architectures on the CIFAR-10 dataset.](./experiments/Acc_FLOPs.
 ## Acknowledgements
 
 This project makes use of the code from [Torch-Pruning](https://github.com/VainF/Torch-Pruning), developed by Gongfan Fang et al. The original code is licensed under the MIT License.
-
 If you use this project, please also consider citing their work:
 
 ```bibtex
