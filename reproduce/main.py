@@ -318,8 +318,8 @@ def get_pruner(model, example_inputs):
         args.sparsity_learning = True
         imp = tp.importance.GroupNormImportance(p=2)
         pruner_entry = partial(tp.pruner.GrowingRegPruner, reg=args.reg, delta_reg=args.delta_reg, global_pruning=args.global_pruning)
-    elif args.method == "group2":
-        sparsity_learning = True
+    elif args.method == "ACP":
+        args.sparsity_learning = True
         speed_up = 4.12/args.target_flops
         thresholds = get_thresholds_layer(model,k=1/speed_up,beta=0)
         print("regularization threshold: {}".format(thresholds))
