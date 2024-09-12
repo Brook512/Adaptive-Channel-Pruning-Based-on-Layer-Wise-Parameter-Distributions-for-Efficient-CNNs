@@ -7,12 +7,110 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import copy
 import torch_pruning as tp
 import engine.utils as utils
 import registry
-
+import numpy as np
 parser = argparse.ArgumentParser()
+
+
+def get_thresholds_layer(model, k=0.5, beta=0):
+  
+    
+    thresholds = {}
+    for name, layer in model.named_modules():
+        if isinstance(layer, nn.Conv2d):
+            for param_name, param in layer.named_parameters(recurse=False):
+                param_abs = param.abs()
+                flat_param = torch.flatten(param_abs)
+                len_flat_param = len(flat_param)
+                
+                if len_flat_param > 0:  # 检查是否存在参数
+                    topk_param = torch.topk(flat_param, k=int(len_flat_param * k))
+                    threshold_value = topk_param[0][-1] 
+                    full_param_name = f"{name}.{param_name}"
+                    thresholds[full_param_name] = threshold_value.item()+beta  
+    return thresholds
+
+def normalize_dict_values(input_dict):
+
+    values = list(input_dict.values())
+    max_value = max(values)
+    min_value = min(values)
+
+    if max_value == min_value:
+        normalized_dict = {k: 1.0 for k in input_dict}  
+    else:
+        normalized_dict = {k: (v - min_value) / (max_value - min_value) for k, v in input_dict.items()}
+
+    return normalized_dict
+
+def adjust_sensitivity(sensitivity_dict, method='exponential', alpha=1.0, epsilon=1e-6):
+    adjusted_sensitivity_dict = {}
+
+    for name, sensitivity in sensitivity_dict.items():
+        if method == 'inverse':
+            adjusted_sensitivity = 1 / (sensitivity + epsilon)
+        elif method == 'exponential':
+            adjusted_sensitivity = np.exp(alpha * sensitivity)
+        else:
+            raise ValueError("Invalid method. Choose 'inverse' or 'exponential'.")
+        
+        adjusted_sensitivity_dict[name] = adjusted_sensitivity
+
+    return adjusted_sensitivity_dict
+
+def calculate_sensitivity_per_layer(model, dataloader, num_iterations=3, device='cpu'):
+
+    def evaluate_model(model):
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for inputs, labels in dataloader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+        accuracy = correct / total
+        return accuracy
+
+    original_accuracy = evaluate_model(model)
+
+    sensitivity_dict = {}
+
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Conv2d, nn.Linear)):
+            for param_name, param in module.named_parameters(recurse=False):
+                layer_sensitivity = []
+
+                for _ in range(num_iterations):
+                    model_copy = copy.deepcopy(model)
+                    with torch.no_grad():
+      
+                        copied_module = dict(model_copy.named_modules())[name]
+                        weight = copied_module.weight.data
+
+                        num_params = weight.numel()
+                        num_zero_params = num_params // 2
+
+                        indices = torch.randperm(num_params)[:num_zero_params]
+                        flat_weight = weight.view(-1)
+                        flat_weight[indices] = 0
+
+                    pruned_accuracy = evaluate_model(model_copy)
+
+                    accuracy_loss = original_accuracy - pruned_accuracy
+                    layer_sensitivity.append(accuracy_loss)
+
+                full_param_name = f"{name}.{param_name}"
+                average_sensitivity = sum(layer_sensitivity) / len(layer_sensitivity)
+                sensitivity_dict[full_param_name] = average_sensitivity
+    normalized_dict = normalize_dict_values(sensitivity_dict)
+    sensitivity = adjust_sensitivity(normalized_dict)
+    return sensitivity
 
 # Basic options
 parser.add_argument("--mode", type=str, required=True, choices=["pretrain", "prune", "test"])
@@ -220,6 +318,13 @@ def get_pruner(model, example_inputs):
         args.sparsity_learning = True
         imp = tp.importance.GroupNormImportance(p=2)
         pruner_entry = partial(tp.pruner.GrowingRegPruner, reg=args.reg, delta_reg=args.delta_reg, global_pruning=args.global_pruning)
+    elif args.method == "group2":
+        sparsity_learning = True
+        speed_up = 4.12/args.target_flops
+        thresholds = get_thresholds_layer(model,k=1/speed_up,beta=0)
+        print("regularization threshold: {}".format(thresholds))
+        imp = tp.importance.ACPImportance(thresholds=thresholds) 
+        pruner_entry = partial(tp.pruner.ACPPruner, reg=args.reg, global_pruning=args.global_pruning)
     else:
         raise NotImplementedError
     

@@ -806,6 +806,249 @@ class GroupHessianImportance(GroupNormImportance):
         group_imp = self._reduce(group_imp, group_idxs)
         group_imp = self._normalize(group_imp, self.normalizer)
         return group_imp
+class ACPImportance(GroupNormImportance):
+    def __init__(self, 
+                 group_reduction: str = "mean", 
+                 normalizer: str = 'mean', 
+                 multivariable: bool = False, 
+                 bias: bool = False,
+                 thresholds: dict = None,  # 新增参数，字典形式
+                 target_types: list = [nn.modules.conv._ConvNd, nn.Linear, nn.modules.batchnorm._BatchNorm, nn.modules.LayerNorm]):
+        self.group_reduction = group_reduction
+        self.normalizer = normalizer
+        self.multivariable = multivariable
+        self.target_types = target_types
+        self.bias = bias
+        self.thresholds = thresholds if thresholds is not None else {}  # 初始化阈值字典
+
+    @torch.no_grad()
+    def __call__(self, group: Group):
+        group_imp = []
+        group_idxs = []
+        
+        # Iterate over all groups and estimate group importance
+        for i, (dep, idxs) in enumerate(group):
+            layer = dep.layer
+            
+            name = dep.target._name
+            prune_fn = dep.pruning_fn
+            root_idxs = group[i].root_idxs
+            if not isinstance(layer, tuple(self.target_types)):
+                continue
+
+            # print(name)
+            threshold = self.thresholds.get(name+".weight", 0.01)  # 使用唯一名称获取阈值
+            # 使用唯一名称获取阈值
+            
+            ####################
+            # Conv/Linear Output
+            ####################
+            if prune_fn in [
+                function.prune_conv_out_channels,
+                function.prune_linear_out_channels,
+            ]:
+                if hasattr(layer, "transposed") and layer.transposed:
+                    w = layer.weight.data.transpose(1, 0)[idxs].flatten(1)
+                else:
+                    w = layer.weight.data[idxs].flatten(1)
+                w = torch.abs(w)
+                
+                len_w = w.size(1)
+                local_imp = torch.sum(w >= threshold, dim=1) / len_w  # 使用指定阈值
+                group_imp.append(local_imp)
+                group_idxs.append(root_idxs)
+
+                if self.bias and layer.bias is not None:
+                    b = layer.bias.data[idxs].abs()
+                    len_b = b.size(1)
+                    local_imp = torch.sum(b >= threshold, dim=1) / len_b  # 使用指定阈值
+                    group_imp.append(local_imp)
+                    group_idxs.append(root_idxs)
+
+            ####################
+            # Conv/Linear Input
+            ####################
+            elif prune_fn in [
+                function.prune_conv_in_channels,
+                function.prune_linear_in_channels,
+            ]:
+                if hasattr(layer, "transposed") and layer.transposed:
+                    w = (layer.weight.data).flatten(1)
+                else:
+                    w = (layer.weight.data).transpose(0, 1).flatten(1)  # 64 576
+         
+                w = torch.abs(w)
+                len_w = w.size(1)
+                local_imp = torch.sum(w >= threshold, dim=1) / len_w  # 使用指定阈值
+                
+                if prune_fn == function.prune_conv_in_channels and layer.groups != layer.in_channels and layer.groups != 1:
+                    local_imp = local_imp.repeat(layer.groups)
+                
+                local_imp = local_imp[idxs]
+                # print(local_imp)
+                group_imp.append(local_imp)
+                group_idxs.append(root_idxs)
+
+            ####################
+            # BatchNorm
+            ####################
+            elif prune_fn == function.prune_batchnorm_out_channels:
+                if layer.affine:
+                    w = layer.weight.data[idxs]
+                    local_imp = w.abs().pow(2)
+                    group_imp.append(local_imp)
+                    group_idxs.append(root_idxs)
+
+                    if self.bias and layer.bias is not None:
+                        b = layer.bias.data[idxs].abs().pow(2)
+                        group_imp.append(local_imp)
+                        group_idxs.append(root_idxs)
+
+            ####################
+            # LayerNorm
+            ####################
+            elif prune_fn == function.prune_layernorm_out_channels:
+                if layer.elementwise_affine:
+                    w = layer.weight.data[idxs]
+                    w = torch.abs(w)
+                    local_imp = torch.sum(w >= threshold, dim=1) / len_w  # 使用指定阈值
+                    group_imp.append(local_imp)
+                    group_idxs.append(root_idxs)
+
+                    if self.bias and layer.bias is not None:
+                        b = layer.bias.data[idxs].abs()
+                        local_imp = torch.sum(b >= threshold, dim=1) / len_b  # 使用指定阈值
+                        group_imp.append(local_imp)
+                        group_idxs.append(root_idxs)
+
+        if len(group_imp) == 0:  # skip groups without parameterized layers
+            return None
+
+        group_imp = self._reduce(group_imp, group_idxs)
+        group_imp = self._normalize(group_imp, self.normalizer)
+        return group_imp 
+class LACPImportance(GroupNormImportance):
+    def __init__(self, 
+                 group_reduction: str = "mean", 
+                 normalizer: str = 'mean', 
+                 multivariable: bool = False, 
+                 bias: bool = False,
+                 thresholds: dict = None,  # 新增参数，字典形式
+                 layer_sens: dict = None,
+                 target_types: list = [nn.modules.conv._ConvNd, nn.Linear, nn.modules.batchnorm._BatchNorm, nn.modules.LayerNorm]):
+        self.group_reduction = group_reduction
+        self.normalizer = normalizer
+        self.multivariable = multivariable
+        self.target_types = target_types
+        self.bias = bias
+        self.thresholds = thresholds if thresholds is not None else {}  # 初始化阈值字典
+        self.layer_sens = layer_sens
+
+    @torch.no_grad()
+    def __call__(self, group: Group):
+        group_imp = []
+        group_idxs = []
+        
+        # Iterate over all groups and estimate group importance
+        for i, (dep, idxs) in enumerate(group):
+            layer = dep.layer
+            
+            name = dep.target._name
+            # param_name = layer.__name__
+            prune_fn = dep.pruning_fn
+            root_idxs = group[i].root_idxs 
+            if not isinstance(layer, tuple(self.target_types)):
+                continue
+
+            # print(name)
+            threshold = self.thresholds.get(name+".weight", 0.01)  # 使用唯一名称获取阈值
+            sensitivity = self.layer_sens.get(name+".weight", 1)
+            ####################
+            # Conv/Linear Output
+            ####################
+            if prune_fn in [
+                function.prune_conv_out_channels,
+                function.prune_linear_out_channels,
+            ]:
+                if hasattr(layer, "transposed") and layer.transposed:
+                    w = layer.weight.data.transpose(1, 0)[idxs].flatten(1)
+                else:
+                    w = layer.weight.data[idxs].flatten(1)
+                w = torch.abs(w)
+                
+                len_w = w.size(1)
+                local_imp = torch.sum(w >= threshold, dim=1) / len_w * sensitivity  # 使用指定阈值
+                group_imp.append(local_imp)
+                group_idxs.append(root_idxs)
+
+                if self.bias and layer.bias is not None:
+                    b = layer.bias.data[idxs].abs()
+                    len_b = b.size(1)
+                    local_imp = torch.sum(b >= threshold, dim=1) / len_b * sensitivity  # 使用指定阈值
+                    group_imp.append(local_imp)
+                    group_idxs.append(root_idxs)
+
+            ####################
+            # Conv/Linear Input
+            ####################
+            elif prune_fn in [
+                function.prune_conv_in_channels,
+                function.prune_linear_in_channels,
+            ]:
+                if hasattr(layer, "transposed") and layer.transposed:
+                    w = (layer.weight.data).flatten(1)
+                else:
+                    w = (layer.weight.data).transpose(0, 1).flatten(1)  # 64 576
+         
+                w = torch.abs(w)
+                len_w = w.size(1)
+                local_imp = torch.sum(w >= threshold, dim=1) / len_w * sensitivity  # 使用指定阈值
+                
+                if prune_fn == function.prune_conv_in_channels and layer.groups != layer.in_channels and layer.groups != 1:
+                    local_imp = local_imp.repeat(layer.groups)
+                
+                local_imp = local_imp[idxs]
+                group_imp.append(local_imp)
+                group_idxs.append(root_idxs)
+
+            ####################
+            # BatchNorm
+            ####################
+            elif prune_fn == function.prune_batchnorm_out_channels:
+                if layer.affine:
+                    w = layer.weight.data[idxs]
+                    local_imp = w.abs().pow(2) * sensitivity
+                    group_imp.append(local_imp)
+                    group_idxs.append(root_idxs)
+
+                    if self.bias and layer.bias is not None:
+                        b = layer.bias.data[idxs].abs().pow(2)
+                        group_imp.append(local_imp)
+                        group_idxs.append(root_idxs)
+
+            ####################
+            # LayerNorm
+            ####################
+            elif prune_fn == function.prune_layernorm_out_channels:
+                if layer.elementwise_affine:
+                    w = layer.weight.data[idxs]
+                    w = torch.abs(w)
+                    local_imp = torch.sum(w >= threshold, dim=1) / len_w * sensitivity  # 使用指定阈值
+                    group_imp.append(local_imp)
+                    group_idxs.append(root_idxs)
+
+                    if self.bias and layer.bias is not None:
+                        b = layer.bias.data[idxs].abs()
+                        local_imp = torch.sum(b >= threshold, dim=1) / len_b * sensitivity  # 使用指定阈值
+                        group_imp.append(local_imp)
+                        group_idxs.append(root_idxs)
+
+        if len(group_imp) == 0:  # skip groups without parameterized layers
+            return None
+
+        group_imp = self._reduce(group_imp, group_idxs)
+        group_imp = self._normalize(group_imp, self.normalizer)
+        return group_imp 
 
 
 # Aliases
